@@ -86,12 +86,13 @@ class POD:
         """Truncates the spatial mode matrix U to yield the reduced projection matrix phi.
         Either provide the reduced rank 'r' directly or give an information threshold 'e'.
         """
-        rel_energy = 0
-        e_tot = np.sum(self.S**2)
-        for r, sigma_j in enumerate(self.S):
-            rel_energy += sigma_j**2 / e_tot
-            if rel_energy >= e:
-                break
+        if e is not None:
+            rel_energy = 0
+            e_tot = np.sum(self.S**2)
+            for r, sigma_j in enumerate(self.S):
+                rel_energy += sigma_j**2 / e_tot
+                if rel_energy >= e:
+                    break
         self.r = r
         phi = self.U[:, :r]
         self.phi = phi
@@ -109,7 +110,7 @@ class POD:
 
     def unmap(self, x_tilde: np.array) -> np.array:
         """
-        Maps a state vector back to the original space from the reduced space.
+        Maps a state vector back to the original full space from the reduced space.
         """
         assert (
             x_tilde.shape[0] == self.phi.shape[1]
@@ -136,6 +137,12 @@ class POD:
 
         print("Baking reduced order model.")
         rom = Model(model_type=rigorous_model.model_type)
+        # Copy the inputs
+        [
+            rom.set_variable(var_type="_u", var_name=input_key)
+            for input_key in rigorous_model._u["name"]
+            if input_key not in rom._u["name"]
+        ]
         x_tld = np.array(
             [
                 rom.set_variable(var_type="_x", var_name=f"x_tld_{i}")
@@ -155,6 +162,11 @@ class POD:
             # replace the original variables in the rhs with the approximated version
             rhs_expr.append(rigorous_model.rhs_list[i]["expr"])
 
+        # replace the input variables
+        rhs_expr = castools.substitute(
+            rhs_expr, rigorous_model._u["var"], rom._u["var"]
+        )
+        # replace the original states with the approximated original states
         rhs_expr = castools.substitute(rhs_expr, old_vars, x_approx[:, 0].tolist())
 
         # map the full rhs back to the reduced space
