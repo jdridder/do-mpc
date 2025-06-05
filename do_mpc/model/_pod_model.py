@@ -1,9 +1,8 @@
-from typing import Callable, Tuple
+from typing import Union
 
-import casadi.tools as castools
 import numpy as np
 from casadi import *
-from do_mpc.data import Data, load_results
+from do_mpc.data import load_results
 from do_mpc.model import Model
 
 
@@ -54,13 +53,13 @@ class POD:
         ), f"The number of total states in the input ({x.shape[0]}) cannot correspond to the number of unique states ({self.nx_unique})."
         block_size = nx_total // self.nx_unique
         x_scaled = np.zeros_like(x)
-        scales = []
+        scales = np.zeros(shape=(nx_total, 1))
         for i in range(self.nx_unique):
             block = x[i * block_size : (i + 1) * block_size, :]
             absmax = np.max(np.abs(block))
             x_scaled[i * block_size : (i + 1) * block_size, :] = block / absmax
-            scales.append(absmax)
-        self.block_size, self.scales = block_size, scales
+            scales[i * block_size : (i + 1) * block_size, :] = 1 / absmax
+        self.scales = scales
         return x_scaled
 
     def scale(self, x: np.array) -> np.array:
@@ -98,37 +97,40 @@ class POD:
         self.phi = phi
         return phi
 
-    def map(self, x: np.array) -> np.array:
+    def map(self, x: Union[np.array, SX, MX]) -> Union[np.array, SX, MX]:
         """
         Maps a state vector from full space to the reduced space.
         """
-        assert (
-            x.shape[0] == self.phi.shape[0]
-        ), f"Full state vector x must be of lenght {self.phi.shape[0]} to match the data. It is of shape {x.shape}."
-        x_scaled = self.scale(x=x)
+        assert x.shape == (
+            self.phi.shape[0],
+            1,
+        ), f"Full state vector x must be of shape {(self.phi.shape[0], 1)} to match the data. It is of shape {x.shape}."
+        x_scaled = x * self.scales
         return self.phi.T @ x_scaled
 
-    def unmap(self, x_tilde: np.array) -> np.array:
+    def unmap(self, x_tilde: Union[np.array, SX, MX]) -> Union[np.array, SX, MX]:
         """
         Maps a state vector back to the original full space from the reduced space.
         """
-        assert (
-            x_tilde.shape[0] == self.phi.shape[1]
+        assert x_tilde.shape == (
+            self.phi.shape[1],
+            1,
         ), f"The inner product of the reduced state vector ({x_tilde.shape}) cannot be done using the projection matrix ({self.phi.shape})."
         x_scaled = self.phi @ x_tilde
-        return self.invert_scale(x_scaled=x_scaled)
+        x = x_scaled / self.scales
+        return x
 
     def reduce(self, rigorous_model: Model, e: float = None, r: int = None) -> Model:
         """Reduces the state space via Proper Orthogonal Decomposition from rank n to lower rank r."""
         assert (
-            rigorous_model.flags["setup"] is False
-        ), "The original model has been set up already. Pass a model that has not been set up."
+            rigorous_model.flags["setup"] is True
+        ), "The original model has not been set up. Pass a model that has been set up."
         if r is None:
             if e is None:
                 raise ValueError(
                     "Provide either the information threshold 'e' or the reduced rank 'r' directly to determine the projection matrix 'phi'."
                 )
-        state_keys = rigorous_model._x["name"]
+        state_keys = rigorous_model.x.keys()
         self.truncate(e=e, r=r)
         nx_model, nx_data = len(state_keys), self.phi.shape[0]
         assert (
@@ -137,12 +139,6 @@ class POD:
 
         print("Baking reduced order model.")
         rom = Model(model_type=rigorous_model.model_type)
-        # Copy the inputs
-        [
-            rom.set_variable(var_type="_u", var_name=input_key)
-            for input_key in rigorous_model._u["name"]
-            if input_key not in rom._u["name"]
-        ]
         x_tld = np.array(
             [
                 rom.set_variable(var_type="_x", var_name=f"x_tld_{i}")
@@ -153,29 +149,32 @@ class POD:
         )  # the reduced states x_tilde
         x_approx = self.unmap(x_tilde=x_tld)  # the approximated full states
 
-        old_vars = []
-        rhs_expr = []
-        for i, x_approx_i in enumerate(x_approx):
-            old_vars.append(rigorous_model._x["var"][i])
+        # Transfer the original model's variables and expressions to the ROM
+        for key in rigorous_model.u.keys()[1:]:
+            rom.set_variable("_u", key, shape=rigorous_model.u[key].shape)
+        for key in rigorous_model.tvp.keys()[1:]:
+            rom.set_variable("_tvp", key, shape=rigorous_model.tvp[key].shape)
+        for key in rigorous_model.p.keys()[1:]:
+            rom.set_variable("_p", key, shape=rigorous_model.p[key].shape)
+        # TODO: Double check copying of the noise. This may be not correct.
+        for key in rigorous_model.w.keys()[1:]:
+            rom.set_variable("_w", key, shape=rigorous_model.p[key].shape)
+        for key in rigorous_model.aux.keys()[1:]:
+            expr_fun = rigorous_model._aux_expression_fun
+            expr = expr_fun(x_approx, rom.u, rom.z, rom.tvp, rom.p)
+            expr_struct = rigorous_model._aux_expression(expr)
+            rom.set_expression(key, expr_struct[key])
+
+        for key, x_approx_i in zip(state_keys, x_approx):
             # set them as auxillary expressions to be able to set contraints in the original space
-            rom.set_expression(expr_name=state_keys[i], expr=x_approx_i[0])
-            # replace the original variables in the rhs with the approximated version
-            rhs_expr.append(rigorous_model.rhs_list[i]["expr"])
+            rom.set_expression(expr_name=key, expr=x_approx_i[0])
 
-        # replace the input variables
-        rhs_expr = castools.substitute(
-            rhs_expr, rigorous_model._u["var"], rom._u["var"]
-        )
-        # replace the original states with the approximated original states
-        rhs_expr = castools.substitute(rhs_expr, old_vars, x_approx[:, 0].tolist())
-
+        rhs_fun = rigorous_model._rhs_fun
+        rhs_expr = rhs_fun(x_approx, rom.u, rom.z, rom.tvp, rom.p, rom.w)
         # map the full rhs back to the reduced space
-        rhs_expr = np.array(rhs_expr).reshape(-1, 1)
         rhs_expr = self.map(x=rhs_expr)
-
-        for i, expr_i in enumerate(rhs_expr):
-            rom.set_rhs(var_name=f"x_tld_{i}", expr=expr_i[0])
-
+        for i in range(rhs_expr.shape[0]):
+            rom.set_rhs(var_name=f"x_tld_{i}", expr=rhs_expr[i, :])
         return rom
 
     # ---------------------------------------
