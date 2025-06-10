@@ -21,6 +21,8 @@ documentation/source/example_gallery/.ipynb_checkpoints/
 
 examples/conti_discrete/main.py
 
+*.egg-info/
+
 testing/results/test_save.pkl
 
 examples/**/*.pkl

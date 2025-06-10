@@ -21,7 +21,6 @@ class POD:
         is passed to the simulator or mpc-object.
         """
         self.nx_unique = nx_unique  # The number of unique states
-        self.block_size = None  # The number of one spatially discretizised state
         self.scales = None  # The scales used to scale each unique state
         self.r = None  # The rank of the reduced system
         self.phi = None  # The trucated orthogonal projection matrix phi
@@ -61,25 +60,6 @@ class POD:
             scales[i * block_size : (i + 1) * block_size, :] = 1 / absmax
         self.scales = scales
         return x_scaled
-
-    def scale(self, x: np.array) -> np.array:
-        """Scales a vector in the original space."""
-        x_scaled = np.zeros_like(x)
-        for i in range(self.nx_unique):
-            x_scaled[i * self.block_size : (i + 1) * self.block_size] = (
-                x[i * self.block_size : (i + 1) * self.block_size] / self.scales[i]
-            )
-        return x_scaled
-
-    def invert_scale(self, x_scaled: np.array) -> np.array:
-        """Inverts the scaling in the original space"""
-        x = np.zeros_like(x_scaled)
-        for i in range(self.nx_unique):
-            x[i * self.block_size : (i + 1) * self.block_size] = (
-                x_scaled[i * self.block_size : (i + 1) * self.block_size]
-                * self.scales[i]
-            )
-        return x
 
     def truncate(self, r: int = None, e: float = None) -> np.array:
         """Truncates the spatial mode matrix U to yield the reduced projection matrix phi.
@@ -130,24 +110,17 @@ class POD:
                 raise ValueError(
                     "Provide either the information threshold 'e' or the reduced rank 'r' directly to determine the projection matrix 'phi'."
                 )
-        state_keys = rigorous_model.x.keys()
         self.truncate(e=e, r=r)
-        nx_model, nx_data = len(state_keys), self.phi.shape[0]
+        nx_model, nx_data = rigorous_model.n_x, self.phi.shape[0]
         assert (
             nx_model == nx_data
         ), f"The number of states in the model ({nx_model}) does not match the number of states arising from the data matrix ({nx_data})."
 
         print("Baking reduced order model.")
         rom = Model(model_type=rigorous_model.model_type)
-        x_tld = np.array(
-            [
-                rom.set_variable(var_type="_x", var_name=f"x_tld_{i}")
-                for i in range(self.r)
-            ]
-        ).reshape(
-            -1, 1
-        )  # the reduced states x_tilde
-        x_approx = self.unmap(x_tilde=x_tld)  # the approximated full states
+        x_tld = rom.set_variable(var_type="_x", var_name="x_tld", shape=(r, 1))
+        x_approx = self.unmap(x_tilde=x_tld)
+        # the approximated full states, shape = (n_x, 1)
 
         # Transfer the original model's variables and expressions to the ROM
         for key in rigorous_model.u.keys()[1:]:
@@ -157,6 +130,7 @@ class POD:
         for key in rigorous_model.p.keys()[1:]:
             rom.set_variable("_p", key, shape=rigorous_model.p[key].shape)
         # TODO: Double check copying of the noise. This may be not correct.
+        # TODO: Copy measurements
         for key in rigorous_model.w.keys()[1:]:
             rom.set_variable("_w", key, shape=rigorous_model.p[key].shape)
         for key in rigorous_model.aux.keys()[1:]:
@@ -165,16 +139,19 @@ class POD:
             expr_struct = rigorous_model._aux_expression(expr)
             rom.set_expression(key, expr_struct[key])
 
-        for key, x_approx_i in zip(state_keys, x_approx):
+        block_size = nx_model // self.nx_unique
+        state_keys = rigorous_model.x.keys()
+        for j, key in enumerate(state_keys):
             # set them as auxillary expressions to be able to set contraints in the original space
-            rom.set_expression(expr_name=key, expr=x_approx_i[0])
-
+            # Note, they are also set as vectorized expressions according to the original state vectors.
+            rom.set_expression(
+                expr_name=key, expr=x_approx[j * block_size : (j + 1) * block_size]
+            )
         rhs_fun = rigorous_model._rhs_fun
         rhs_expr = rhs_fun(x_approx, rom.u, rom.z, rom.tvp, rom.p, rom.w)
         # map the full rhs back to the reduced space
         rhs_expr = self.map(x=rhs_expr)
-        for i in range(rhs_expr.shape[0]):
-            rom.set_rhs(var_name=f"x_tld_{i}", expr=rhs_expr[i, :])
+        rom.set_rhs(var_name="x_tld", expr=rhs_expr)
         return rom
 
     # ---------------------------------------
